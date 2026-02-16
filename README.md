@@ -80,6 +80,27 @@ uv run main.py top-papers --limit 20
 - Displays ICLR 2026 papers authored by them.
 - Optional: `--export results.json` to save output.
 
+- Optional: `--export results.json` to save output.
+
+### 4. Author Awards (Experimental)
+
+Estimate how many papers by an author have received awards (based on Semantic Scholar data).
+
+**Step 1: Enrich Data**
+```bash
+uv run main.py enrich-authors --limit 50
+```
+-   Resolves Semantic Scholar IDs using ICLR papers.
+-   Scans publication history for keywords like "Best Paper", "Award", "Spotlight", "Oral".
+-   Updates `authors` collection with `award_estimate_count`.
+-   *Note: This process is rate-limited and slow (approx 1 sec/author).*
+
+**Step 2: Show Awards**
+```bash
+uv run main.py show-awards
+```
+-   Lists all authors with detected awards in the database.
+
 ## Data Structure
 
 **Database**: `iclr-2026`

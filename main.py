@@ -348,5 +348,209 @@ def top_papers(limit: int = 10, export: str = None):
             json.dump(results, f, indent=2)
         print(f"\nExported {len(results)} papers to {export}")
 
+def make_request_with_backoff(url, params=None, max_retries=5, backoff_factor=1.0):
+    """
+    Makes a GET request with exponential backoff for 429 situations.
+    """
+    import time
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, params=params)
+            if r.status_code == 200:
+                return r
+            elif r.status_code == 429:
+                sleep_time = backoff_factor * (2 ** attempt)
+                print(f"Rate limited (429). Retrying in {sleep_time}s...")
+                time.sleep(sleep_time)
+            else:
+                # Other errors, maybe transient?
+                if r.status_code >= 500:
+                    sleep_time = backoff_factor * (2 ** attempt)
+                    time.sleep(sleep_time)
+                else:
+                     return r # Return error response
+        except Exception as e:
+            print(f"Request exception: {e}")
+            sleep_time = backoff_factor * (2 ** attempt)
+            time.sleep(sleep_time)
+            
+    return None
+
+@app.command()
+def enrich_authors(limit: int = 0):
+    """
+    Enriches author data with award estimates from Semantic Scholar.
+    Uses ICLR 2026 papers to resolve Author IDs accurately.
+    """
+    mongo_client = MongoClient(MONGO_URI)
+    db = mongo_client[DB_NAME]
+    try:
+        authors_col = db[AUTHORS_COLLECTION]
+        papers_col = db[COLLECTION_NAME]
+    except Exception as e:
+        print(f"DB Error: {e}")
+        return
+
+    # Get authors who need enrichment (or all if we want to update)
+    # targeting those without 'ss_id' or force update?
+    # For now, process all or limit.
+    query = {}
+    total_authors = authors_col.count_documents(query)
+    print(f"Found {total_authors} authors to enrich.")
+    
+    cursor = authors_col.find(query)
+    if limit > 0:
+        cursor = cursor.limit(limit)
+
+    import time
+    
+    processed = 0
+    updated = 0
+    
+    for author_doc in tqdm(list(cursor), desc="Enriching Authors"):
+        processed += 1
+        name = author_doc.get('names', [''])[0]
+        aid = author_doc.get('_id')
+        
+        # Check if already has SS data? verify update strategy.
+        # if 'ss_id' in author_doc: continue 
+        
+        # 1. Find a paper they authored to resolve ID
+        paper = papers_col.find_one({"authors": name})
+        if not paper:
+            # Should not happen if data is consistent
+            continue
+            
+        paper_title = paper.get('title')
+        
+        # 2. Search SS for this paper
+        ss_author_id = None
+        
+        try:
+            # Search Paper
+            search_url = "https://api.semanticscholar.org/graph/v1/paper/search"
+            # Use backoff
+            r = make_request_with_backoff(search_url, params={"query": paper_title, "fields": "authors", "limit": 1})
+            
+            if r and r.status_code == 200:
+                data = r.json()
+                if 'data' in data and data['data']:
+                    ss_paper = data['data'][0]
+                    # Find matching author
+                    for a in ss_paper.get('authors', []):
+                        # Simple name match? 
+                        # name in DB: "Evgeny Burnaev"
+                        # name in SS: "E. Burnaev" or "Evgeny Burnaev"
+                        # We use simple inclusion or approximate match?
+                        # Let's try flexible match.
+                        a_name = a.get('name', '')
+                        if not a_name: continue
+                        
+                        # Check if last names match and first initial?
+                        # Normalize
+                        db_parts = name.lower().split()
+                        ss_parts = a_name.lower().split()
+                        
+                        if len(db_parts) > 0 and len(ss_parts) > 0:
+                            # Last name match
+                            if db_parts[-1] == ss_parts[-1]:
+                                ss_author_id = a.get('authorId')
+                                break
+        except Exception as e:
+            # print(f"SS Search Error: {e}")
+            pass
+            
+        if not ss_author_id:
+            # Fallback: Search author by name? (Less reliable)
+            pass
+        else:
+            # 3. Fetch Author Details (Awards check)
+            try:
+                # rate limit
+                time.sleep(1.0) # be nice to public API
+                
+                details_url = f"https://api.semanticscholar.org/graph/v1/author/{ss_author_id}"
+                # We need papers to scan for awards
+                d_params = {
+                    "fields": "papers.venue,papers.publicationVenue,papers.title,papers.year",
+                    "limit": 500
+                }
+                
+                # Use backoff
+                r2 = make_request_with_backoff(details_url, params=d_params)
+                
+                if r2 and r2.status_code == 200:
+                    details = r2.json()
+                    papers_list = details.get('papers', [])
+                    
+                    # 4. Count Awards
+                    award_keywords = ['best paper', 'award', 'spotlight', 'oral', 'distinguished', 'prize']
+                    # Note: "Oral" might match "Temporal..." if insensitive? -> No, "Oral" is usually a standalone word or "Oral Presentation".
+                    # Be careful with "Oral". In ICLR context, we are looking for filtered papers too.
+                    # But checking previous history.
+                    
+                    award_count = 0
+                    award_matches = []
+                    
+                    for p in papers_list:
+                        venue_str = (p.get('venue') or '') + " " + (str(p.get('publicationVenue') or ''))
+                        venue_lower = venue_str.lower()
+                        title_lower = (p.get('title') or '').lower()
+                        
+                        # Heuristic check
+                        found_kw = []
+                        for kw in award_keywords:
+                            if kw in venue_lower:
+                                found_kw.append(kw)
+                        
+                        if found_kw:
+                            award_count += 1
+                            award_matches.append({
+                                "title": p.get('title'),
+                                "venue": venue_str,
+                                "year": p.get('year'),
+                                "keywords": found_kw
+                            })
+                            
+                    # Update DB
+                    authors_col.update_one(
+                        {"_id": aid},
+                        {"$set": {
+                            "ss_id": ss_author_id,
+                            "award_estimate_count": award_count,
+                            "award_details": award_matches,
+                            "enriched_at": datetime.now()
+                        }}
+                    )
+                    updated += 1
+                    
+            except Exception as e:
+                pass
+
+    print(f"Enrichment complete. Processed {processed}. Updated {updated}.")
+
+@app.command()
+def show_awards():
+    """
+    Lists authors with detected awards.
+    """
+    mongo_client = MongoClient(MONGO_URI)
+    db = mongo_client[DB_NAME]
+    authors_col = db[AUTHORS_COLLECTION]
+    
+    # query for award_estimate_count > 0
+    query = {"award_estimate_count": {"$gt": 0}}
+    authors = list(authors_col.find(query).sort("award_estimate_count", -1))
+    
+    print(f"Found {len(authors)} authors with potential awards.")
+    
+    for a in authors:
+        name = a.get('names', [''])[0]
+        count = a.get('award_estimate_count')
+        details = a.get('award_details', [])
+        print(f"\nAuthor: {name} (Count: {count})")
+        for d in details:
+            print(f"  - {d.get('title')} ({d.get('venue')})")
+
 if __name__ == "__main__":
     app()
