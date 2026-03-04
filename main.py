@@ -204,15 +204,21 @@ def process_authors():
         
         # OpenReview Profile
         or_profile = {}
+        author_institution = None
+        author_email = None
         if primary_id and primary_id.startswith('~'):
             try:
                 # API V2 get_profile
                 p = or_client.get_profile(primary_id)
                 if p:
+                    author_institution = p.content.get('history', [{}])[0].get('institution', {}).get('name') if p.content.get('history') else None
+                    # Preferred email first, then fall back to first in emails list
+                    author_email = p.content.get('preferredEmail') or (p.content.get('emails', [None])[0])
                     or_profile = {
                         "id": p.id,
                         "preferred_name": p.get_preferred_name(),
-                        "institution": p.content.get('history', [{}])[0].get('institution', {}).get('name') if p.content.get('history') else None
+                        "institution": author_institution,
+                        "email": author_email,
                     }
             except Exception:
                 pass
@@ -255,6 +261,8 @@ def process_authors():
             "names": list(data["names"]),
             "ids": list(data["ids"]),
             "iclr_2026_count": data["papers_in_dataset"],
+            "institution": author_institution,
+            "email": author_email,
             "openreview": or_profile,
             "arxiv": arxiv_stats,
             "updated_at": datetime.now()
@@ -400,7 +408,7 @@ def build_llm_client():
     Reads LLM_PROVIDER / LLM_MODEL from env and returns a callable:
         ask(prompt: str) -> str
 
-    Supported providers: ollama, openai, anthropic
+    Supported providers: ollama, openai, anthropic, vllm
     """
     provider = os.getenv('LLM_PROVIDER', 'ollama').lower()
     model = os.getenv('LLM_MODEL', 'gpt-oss:20b')
@@ -415,7 +423,7 @@ def build_llm_client():
                 "stream": False,
                 "messages": [{"role": "user", "content": prompt}]
             }
-            r = requests.post(chat_url, json=payload, timeout=60)
+            r = requests.post(chat_url, json=payload, timeout=600)
             r.raise_for_status()
             return r.json().get('message', {}).get('content', '').strip()
 
@@ -449,8 +457,25 @@ def build_llm_client():
 
         return ask
 
+    elif provider == 'vllm':
+        # vLLM serves an OpenAI-compatible API; reuse the openai SDK.
+        from openai import OpenAI
+        base_url = os.getenv('VLLM_BASE_URL', 'http://localhost:8000/v1').rstrip('/')
+        api_key = os.getenv('VLLM_API_KEY', 'EMPTY')  # local vLLM typically needs no key
+        client = OpenAI(base_url=base_url, api_key=api_key)
+
+        def ask(prompt: str) -> str:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0
+            )
+            return response.choices[0].message.content.strip()
+
+        return ask
+
     else:
-        raise ValueError(f"Unsupported LLM_PROVIDER: '{provider}'. Use ollama, openai, or anthropic.")
+        raise ValueError(f"Unsupported LLM_PROVIDER: '{provider}'. Use ollama, openai, anthropic, or vllm.")
 
 
 def validate_linkedin_with_llm(ask, author_name: str, institution: str, candidates: list) -> str | None:
@@ -760,5 +785,208 @@ def awarded_papers():
             details = author_map[a].get('award_details', [])
             print(f"  * {a}: {len(details)} prior awards detected.")
 
+@app.command()
+def generate_synopses(
+    limit: int = 0,
+    force: bool = False,
+    max_pages: int = 0,
+    max_chars: int = 0,
+):
+    """
+    Generates a synopsis for each paper in the DB by reading its local PDF.
+    Extracts text with pypdf, sends it to the configured LLM, and saves the
+    synopsis back to the 'synopsis' field in MongoDB.
+
+    --limit N      Process only N papers (0 = all).
+    --force        Re-generate synopses for papers that already have one.
+    --max-pages N  Read at most N pages per PDF (0 = all pages).
+    --max-chars N  Truncate extracted text to N characters before sending to
+                   the LLM (0 = no truncation). A warning is printed when the
+                   text is large and no limit is set.
+    """
+    from pypdf import PdfReader
+
+    mongo_client = MongoClient(MONGO_URI)
+    db = mongo_client[DB_NAME]
+    collection = db[COLLECTION_NAME]
+
+    # Build LLM client
+    print("Initializing LLM client...")
+    try:
+        ask = build_llm_client()
+    except Exception as e:
+        print(f"Failed to build LLM client: {e}")
+        return
+
+    # Fetch papers
+    query = {} if force else {"synopsis": {"$exists": False}}
+    total = collection.count_documents(query)
+    print(f"Found {total} papers {'(all, force mode)' if force else 'without a synopsis'}.")
+
+    cursor = collection.find(query)
+    if limit > 0:
+        cursor = cursor.limit(limit)
+
+    processed = 0
+    skipped = 0
+    failed = 0
+
+    for paper in tqdm(list(cursor), desc="Generating Synopses"):
+        paper_id = paper.get("_id")
+        title = paper.get("title", "Untitled")
+
+        # Resolve PDF path
+        pdf_path = paper.get("pdf_path")
+        if not pdf_path or not os.path.exists(pdf_path):
+            # Try to find by paper_id in pdfs dir
+            candidate = os.path.join(PDF_DIR, f"{paper_id}.pdf")
+            if os.path.exists(candidate):
+                pdf_path = candidate
+            else:
+                # print(f"  PDF not found for: {title}")
+                skipped += 1
+                continue
+
+        # Extract text from PDF
+        try:
+            reader = PdfReader(pdf_path)
+            total_pages = len(reader.pages)
+            pages_to_read = min(total_pages, max_pages) if max_pages > 0 else total_pages
+
+            if max_pages == 0 and total_pages > 10:
+                tqdm.write(f"  ⚠  '{title}': {total_pages} pages — consider --max-pages to limit context.")
+
+            pages_text = []
+            for i in range(pages_to_read):
+                page_text = reader.pages[i].extract_text() or ""
+                pages_text.append(page_text)
+            full_text = "\n".join(pages_text).strip()
+        except Exception as e:
+            print(f"  Error reading PDF for '{title}': {e}")
+            failed += 1
+            continue
+
+        if not full_text:
+            skipped += 1
+            continue
+
+        # Optionally truncate; warn when text is large and no limit is set
+        if max_chars > 0:
+            truncated = full_text[:max_chars]
+        else:
+            truncated = full_text
+            if len(full_text) > 20_000:
+                tqdm.write(f"  ⚠  '{title}': {len(full_text):,} chars sent to LLM — consider --max-chars to limit context.")
+
+        prompt = (
+            f"You are a research analyst summarizing academic papers for a venture capital audience. Use simple language to explain the paper.\n\n"
+            f"Paper title: {title}\n\n"
+            f"Paper content (first few pages):\n{truncated}\n\n"
+            f"Write a concise synopsis (3-5 sentences) covering:\n"
+            f"1. What problem this paper addresses.\n"
+            f"2. The key method or contribution.\n"
+            f"3. The main result or finding.\n"
+            f"4. Practical applications or use-cases this research unlocks.\n\n"
+            f"Reply with ONLY the synopsis paragraph, no headings or bullet points."
+        )
+
+        try:
+            synopsis = ask(prompt)
+        except Exception as e:
+            print(f"  LLM error for '{title}': {e}")
+            failed += 1
+            continue
+
+        if not synopsis:
+            skipped += 1
+            continue
+
+        # Save to DB
+        try:
+            collection.update_one(
+                {"_id": paper_id},
+                {"$set": {
+                    "synopsis": synopsis,
+                    "synopsis_generated_at": datetime.now()
+                }}
+            )
+            processed += 1
+        except Exception as e:
+            print(f"  DB error saving synopsis for '{title}': {e}")
+            failed += 1
+
+    print(f"\nSynopsis generation complete.")
+    print(f"  Generated : {processed}")
+    print(f"  Skipped   : {skipped}  (no PDF or empty text)")
+    print(f"  Failed    : {failed}")
+
+
+@app.command()
+def export_authors(
+    output: str = "authors_export.csv",
+):
+    """
+    Exports a CSV of authors with their ICLR 2026 paper details and LinkedIn URL.
+
+    Columns: name, paper_title, paper_url, synopsis, linkedin_url
+
+    The file is ready to be imported as a Google Sheet.
+    """
+    import csv
+
+    mongo_client = MongoClient(MONGO_URI)
+    db = mongo_client[DB_NAME]
+    authors_col = db[AUTHORS_COLLECTION]
+    papers_col = db[COLLECTION_NAME]
+
+    authors = list(authors_col.find({}))
+    print(f"Found {len(authors)} authors.")
+
+    rows = []
+
+    for author in authors:
+        name = author.get("names", [""])[0]
+        linkedin_url = author.get("linkedin_url", "")
+        institution = author.get("institution") or author.get("openreview", {}).get("institution", "")
+        email = author.get("email") or author.get("openreview", {}).get("email", "")
+
+        # Find all ICLR 2026 papers for this author
+        author_names = author.get("names", [])
+        papers = list(papers_col.find({"authors": {"$in": author_names}}))
+
+        if papers:
+            for paper in papers:
+                rows.append({
+                    "name": name,
+                    "institution": institution,
+                    "email": email,
+                    "paper_title": paper.get("title", ""),
+                    "paper_url": paper.get("forum_url", paper.get("pdf_url", "")),
+                    "synopsis": paper.get("synopsis", ""),
+                    "linkedin_url": linkedin_url,
+                })
+        else:
+            # Author in DB but no paper found (shouldn't normally happen)
+            rows.append({
+                "name": name,
+                "institution": institution,
+                "email": email,
+                "paper_title": "",
+                "paper_url": "",
+                "synopsis": "",
+                "linkedin_url": linkedin_url,
+            })
+
+    fieldnames = ["name", "institution", "email", "paper_title", "paper_url", "synopsis", "linkedin_url"]
+
+    with open(output, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Exported {len(rows)} rows to '{output}'.")
+
+
 if __name__ == "__main__":
     app()
+
