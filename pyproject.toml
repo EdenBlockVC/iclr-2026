@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "arxiv>=2.4.0",
+    "ddgs>=9.11.1",
     "openreview-py>=1.57.0",
     "pymongo>=4.16.0",
     "requests>=2.32.5",

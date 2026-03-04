@@ -1,5 +1,6 @@
 import typer
 import os
+import re
 import requests
 import time
 import arxiv
@@ -8,6 +9,7 @@ from pymongo import MongoClient
 from openreview.api import OpenReviewClient
 from tqdm import tqdm
 from dotenv import load_dotenv
+from ddgs import DDGS
 
 # Load environment variables
 load_dotenv()
@@ -352,7 +354,6 @@ def make_request_with_backoff(url, params=None, max_retries=5, backoff_factor=1.
     """
     Makes a GET request with exponential backoff for 429 situations.
     """
-    import time
     for attempt in range(max_retries):
         try:
             r = requests.get(url, params=params)
@@ -376,11 +377,142 @@ def make_request_with_backoff(url, params=None, max_retries=5, backoff_factor=1.
             
     return None
 
-@app.command()
-def enrich_authors(limit: int = 0):
+
+# ---------------------------------------------------------------------------
+# LinkedIn helpers
+# ---------------------------------------------------------------------------
+
+def search_linkedin_candidates(name: str, institution: str = None, max_results: int = 5) -> list:
     """
-    Enriches author data with award estimates from Semantic Scholar.
+    Uses DuckDuckGo to search for the person's LinkedIn profile.
+    Returns a list of {title, href, body} dicts (up to max_results).
+    """
+    parts = [f'"{name}"']
+    if institution:
+        parts.append(f'"{institution}"')
+    parts.append('site:linkedin.com/in')
+    query = ' '.join(parts)
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        return results
+    except Exception as e:
+        print(f"  DDGS search error for {name}: {e}")
+        return []
+
+
+def build_llm_client():
+    """
+    Reads LLM_PROVIDER / LLM_MODEL from env and returns a callable:
+        ask(prompt: str) -> str
+
+    Supported providers: ollama, openai, anthropic
+    """
+    provider = os.getenv('LLM_PROVIDER', 'ollama').lower()
+    model = os.getenv('LLM_MODEL', 'gpt-oss:20b')
+
+    if provider == 'ollama':
+        base_url = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434').rstrip('/')
+        chat_url = f"{base_url}/api/chat"
+
+        def ask(prompt: str) -> str:
+            payload = {
+                "model": model,
+                "stream": False,
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            r = requests.post(chat_url, json=payload, timeout=60)
+            r.raise_for_status()
+            return r.json().get('message', {}).get('content', '').strip()
+
+        return ask
+
+    elif provider == 'openai':
+        from openai import OpenAI
+        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+
+        def ask(prompt: str) -> str:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0
+            )
+            return response.choices[0].message.content.strip()
+
+        return ask
+
+    elif provider == 'anthropic':
+        import anthropic as anthropic_sdk
+        client = anthropic_sdk.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
+
+        def ask(prompt: str) -> str:
+            response = client.messages.create(
+                model=model,
+                max_tokens=256,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return response.content[0].text.strip()
+
+        return ask
+
+    else:
+        raise ValueError(f"Unsupported LLM_PROVIDER: '{provider}'. Use ollama, openai, or anthropic.")
+
+
+def validate_linkedin_with_llm(ask, author_name: str, institution: str, candidates: list) -> str | None:
+    """
+    Asks the LLM to identify which (if any) of the DuckDuckGo search results
+    corresponds to the target person.
+
+    Returns the LinkedIn URL string on a confident match, or None.
+    """
+    if not candidates:
+        return None
+
+    candidate_lines = []
+    for i, c in enumerate(candidates, 1):
+        candidate_lines.append(
+            f"{i}. Title: {c.get('title', '')}\n"
+            f"   URL: {c.get('href', '')}\n"
+            f"   Snippet: {c.get('body', '')}"
+        )
+    candidates_text = "\n".join(candidate_lines)
+
+    institution_hint = f" at {institution}" if institution else ""
+    prompt = (
+        f"You are verifying LinkedIn profiles for an academic researcher.\n"
+        f"Target person: {author_name}{institution_hint}\n\n"
+        f"Below are DuckDuckGo search results. Identify which result is the official "
+        f"LinkedIn profile for this exact person.\n\n"
+        f"{candidates_text}\n\n"
+        f"Rules:\n"
+        f"- Reply with ONLY the full LinkedIn URL (e.g. https://linkedin.com/in/...) "
+        f"if you are confident it matches the target person.\n"
+        f"- Reply with NONE if no result is a confident match.\n"
+        f"- Do not include any explanation or extra text."
+    )
+
+    try:
+        response = ask(prompt)
+        # Extract a linkedin.com/in/... URL from the response
+        match = re.search(r'https?://(?:www\.)?linkedin\.com/in/[\w\-%.]+', response)
+        if match:
+            return match.group(0)
+        if 'NONE' in response.upper():
+            return None
+        return None
+    except Exception as e:
+        print(f"  LLM validation error: {e}")
+        return None
+
+@app.command()
+def enrich_authors(limit: int = 0, force: bool = False):
+    """
+    Enriches author data with award estimates from Semantic Scholar
+    and LinkedIn profile URLs via DuckDuckGo + LLM validation.
     Uses ICLR 2026 papers to resolve Author IDs accurately.
+    Pass --force to re-fetch LinkedIn profiles for already-enriched authors.
     """
     mongo_client = MongoClient(MONGO_URI)
     db = mongo_client[DB_NAME]
@@ -402,11 +534,17 @@ def enrich_authors(limit: int = 0):
     if limit > 0:
         cursor = cursor.limit(limit)
 
-    import time
-    
+    # Build LLM client once (reused across all authors)
+    print("Initializing LLM client...")
+    try:
+        ask = build_llm_client()
+    except Exception as e:
+        print(f"Failed to build LLM client: {e}")
+        return
+
     processed = 0
     updated = 0
-    
+
     for author_doc in tqdm(list(cursor), desc="Enriching Authors"):
         processed += 1
         name = author_doc.get('names', [''])[0]
@@ -523,9 +661,33 @@ def enrich_authors(limit: int = 0):
                         }}
                     )
                     updated += 1
-                    
+
             except Exception as e:
                 pass
+
+        # --- LinkedIn enrichment ---
+        # Skip if already done and not forcing
+        if not force and author_doc.get('linkedin_url'):
+            continue
+
+        institution = author_doc.get('openreview', {}).get('institution')
+
+        candidates = search_linkedin_candidates(name, institution)
+        time.sleep(1.5)  # polite delay between DDGS queries
+
+        if candidates:
+            linkedin_url = validate_linkedin_with_llm(ask, name, institution, candidates)
+            if linkedin_url:
+                try:
+                    authors_col.update_one(
+                        {"_id": aid},
+                        {"$set": {
+                            "linkedin_url": linkedin_url,
+                            "linkedin_verified_at": datetime.now()
+                        }}
+                    )
+                except Exception as e:
+                    print(f"  Error saving LinkedIn URL for {name}: {e}")
 
     print(f"Enrichment complete. Processed {processed}. Updated {updated}.")
 
