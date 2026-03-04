@@ -226,7 +226,7 @@ def process_authors():
             search = arxiv.Client().results(
                 arxiv.Search(
                     query=search_query,
-                    max_results=50, # Limit to avoid overload
+                    max_results=100, # Limit to avoid overload
                     sort_by=arxiv.SortCriterion.SubmittedDate
                 )
             )
