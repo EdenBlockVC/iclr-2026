@@ -218,9 +218,9 @@ def process_authors():
                 pass
         
         # arXiv Stats
-        arxiv_stats = {"total_hits": 0, "latest_paper": None}
+        arxiv_stats = {"total_hits": 0, "papers": []}
         try:
-            # Search by name. 
+            # Search by name.
             # Note: Searching by name is ambiguous.
             search_query = f'au:"{primary_name}"'
             search = arxiv.Client().results(
@@ -230,28 +230,21 @@ def process_authors():
                     sort_by=arxiv.SortCriterion.SubmittedDate
                 )
             )
-            
-            count = 0
-            latest = None
-            
-            # Iterate to count. 
-            # The client returns a generator.
+
+            papers_found = []
+
+            # Collect all results (generator).
             for result in search:
-                count += 1
-                if count == 1:
-                    latest = {
-                        "title": result.title,
-                        "date": result.published,
-                        "url": result.entry_id
-                    }
-            
-            arxiv_stats["total_hits"] = count # limited by max_results
-            arxiv_stats["latest_paper"] = latest
-            
-            # If we hit max_results, we know it's at least that many
-            if count == 50:
-                arxiv_stats["total_hits"] = "50+"
-                
+                papers_found.append({
+                    "title": result.title,
+                    "date": result.published,
+                    "url": result.entry_id
+                })
+
+            count = len(papers_found)
+            arxiv_stats["total_hits"] = "50+" if count == 50 else count
+            arxiv_stats["papers"] = papers_found
+
         except Exception as e:
             # print(f"arXiv error for {primary_name}: {e}")
             pass
