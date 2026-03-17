@@ -7,6 +7,7 @@ This project provides tools to scrape accepted **ICLR 2026 (Oral)** papers, down
 - **Paper Scraper**: efficiently fetches "Accept (Oral)" papers from OpenReview V2 API.
 - **PDF Downloader**: automatically downloads PDFs to a local directory.
 - **Author Analysis**: aggregates author metadata and fetches publication statistics from arXiv.
+- **Author Enrichment (PDF)**: parses each paper's PDF to extract author emails and affiliations directly from the paper header.
 - **Author Enrichment**: resolves Semantic Scholar IDs, detects prior awards, and finds LinkedIn profiles via DuckDuckGo + LLM.
 - **Synopsis Generation**: reads each paper's PDF and uses a local/remote LLM to produce a VC-friendly synopsis.
 - **CSV Export**: exports a Google Sheets–ready CSV of authors with paper details and LinkedIn URLs.
@@ -80,7 +81,27 @@ uv run main.py process-authors
 - Searches arXiv for total paper counts and publication list.
 - Stores data in MongoDB collection `iclr-2026.authors`.
 
-### 3. Enrich Authors
+### 3. Enrich Authors from PDF
+
+Parse each paper's PDF to extract author emails and affiliations from the paper header:
+
+```bash
+uv run main.py enrich-authors-from-pdf [--limit N] [--force] [--header-pages N]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--limit N` | `0` (all) | Process only N papers |
+| `--force` | `False` | Overwrite email/institution even if already set |
+| `--header-pages N` | `2` | Number of pages to scan from the top of each PDF |
+
+- Reads the first N pages of each local PDF with `pypdf`.
+- Extracts emails via regex and affiliations via keyword heuristics.
+- Performs positional + name-based matching to associate emails to individual authors.
+- Updates `email`, `institution`, `pdf_enriched_at`, and `pdf_enriched_from` fields in `iclr-2026.authors`.
+- Does **not** overwrite existing values unless `--force` is set.
+
+### 4. Enrich Authors
 
 Enrich author records with Semantic Scholar award history and LinkedIn URLs:
 
@@ -99,7 +120,7 @@ uv run main.py enrich-authors [--limit N] [--force]
 - Updates `authors` collection with `award_estimate_count`, `award_details`, and `linkedin_url`.
 - *Note: rate-limited (~1 s/author for Semantic Scholar, ~1.5 s/author for DuckDuckGo).*
 
-### 4. Generate Synopses
+### 5. Generate Synopses
 
 Generate a VC-friendly synopsis for each paper by reading its PDF:
 
@@ -118,7 +139,7 @@ uv run main.py generate-synopses [--limit N] [--force] [--max-pages N] [--max-ch
 - Sends text to the configured LLM with a VC-focused prompt.
 - Saves the result to the `synopsis` field in `iclr-2026.papers`.
 
-### 5. Top Papers
+### 6. Top Papers
 
 List ICLR 2026 papers from the most prolific authors (by arXiv count):
 
@@ -134,7 +155,7 @@ uv run main.py top-papers [--limit N] [--export results.json]
 - Ranks authors by arXiv total hits.
 - Displays ICLR 2026 papers authored by the top N.
 
-### 6. Show Awards
+### 7. Show Awards
 
 List all authors with detected prior awards:
 
@@ -145,7 +166,7 @@ uv run main.py show-awards
 - Queries the `authors` collection for `award_estimate_count > 0`.
 - Prints each author, their count, and the matching publication titles/venues.
 
-### 7. Awarded Papers
+### 8. Awarded Papers
 
 List ICLR 2026 papers authored by researchers with a prior award history:
 
@@ -156,7 +177,7 @@ uv run main.py awarded-papers
 - Filters current conference papers where at least one author has a detected prior award.
 - Useful for finding potentially high-impact work based on author track record.
 
-### 8. Export Authors
+### 9. Export Authors
 
 Export a Google Sheets–ready CSV of all authors with paper and contact details:
 
@@ -173,7 +194,7 @@ Columns: `name`, `institution`, `email`, `paper_title`, `paper_url`, `synopsis`,
 ## Recommended Workflow
 
 ```
-process-papers → process-authors → enrich-authors → generate-synopses → export-authors
+process-papers → process-authors → enrich-authors-from-pdf → enrich-authors → generate-synopses → export-authors
 ```
 
 ## Data Structure

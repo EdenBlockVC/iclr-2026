@@ -409,6 +409,9 @@ def build_llm_client():
         ask(prompt: str) -> str
 
     Supported providers: ollama, openai, anthropic, vllm
+
+    For openai-compatible servers, set OPENAI_BASE_URL to override the default
+    OpenAI endpoint (e.g. http://localhost:8000/v1).
     """
     provider = os.getenv('LLM_PROVIDER', 'ollama').lower()
     model = os.getenv('LLM_MODEL', 'gpt-oss:20b')
@@ -431,7 +434,11 @@ def build_llm_client():
 
     elif provider == 'openai':
         from openai import OpenAI
-        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        openai_kwargs = {'api_key': os.getenv('OPENAI_API_KEY')}
+        openai_base_url = os.getenv('OPENAI_BASE_URL')
+        if openai_base_url:
+            openai_kwargs['base_url'] = openai_base_url.rstrip('/')
+        client = OpenAI(**openai_kwargs)
 
         def ask(prompt: str) -> str:
             response = client.chat.completions.create(
@@ -457,6 +464,22 @@ def build_llm_client():
 
         return ask
 
+    elif provider == 'llamacpp':
+        from openai import OpenAI
+        base_url = os.getenv('LLAMACPP_BASE_URL', 'http://localhost:8080/v1').rstrip('/')
+        api_key = os.getenv('LLAMACPP_API_KEY', 'EMPTY')
+        client = OpenAI(base_url=base_url, api_key=api_key)
+
+        def ask(prompt: str) -> str:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0
+            )
+            return response.choices[0].message.content.strip()
+
+        return ask
+
     elif provider == 'vllm':
         # vLLM serves an OpenAI-compatible API; reuse the openai SDK.
         from openai import OpenAI
@@ -475,7 +498,32 @@ def build_llm_client():
         return ask
 
     else:
-        raise ValueError(f"Unsupported LLM_PROVIDER: '{provider}'. Use ollama, openai, anthropic, or vllm.")
+        raise ValueError(f"Unsupported LLM_PROVIDER: '{provider}'. Use ollama, openai, anthropic, vllm, or llamacpp.")
+
+
+@app.command()
+def test_llm():
+    """
+    Sends a simple ping prompt to the configured LLM and prints the response.
+    Useful for verifying that LLM_PROVIDER, LLM_MODEL, and related env vars are
+    set correctly before running longer commands.
+    """
+    provider = os.getenv('LLM_PROVIDER', 'ollama')
+    model = os.getenv('LLM_MODEL', 'gpt-oss:20b')
+    print(f"Provider : {provider}")
+    print(f"Model    : {model}")
+    try:
+        ask = build_llm_client()
+    except Exception as e:
+        print(f"Failed to build LLM client: {e}")
+        raise typer.Exit(1)
+
+    try:
+        reply = ask("Reply with exactly the word PONG and nothing else.")
+        print(f"Response : {reply}")
+    except Exception as e:
+        print(f"LLM request failed: {e}")
+        raise typer.Exit(1)
 
 
 def validate_linkedin_with_llm(ask, author_name: str, institution: str, candidates: list) -> str | None:
@@ -523,6 +571,252 @@ def validate_linkedin_with_llm(ask, author_name: str, institution: str, candidat
     except Exception as e:
         print(f"  LLM validation error: {e}")
         return None
+
+@app.command()
+def enrich_authors_from_pdf(
+    limit: int = 0,
+    force: bool = False,
+    header_pages: int = 2,
+):
+    """
+    Parses the local PDF of each paper to extract author information
+    (emails, affiliation/institution) that is embedded in the paper itself,
+    then updates the matching author documents in MongoDB.
+
+    Email-to-author matching is performed by the configured LLM (see
+    LLM_PROVIDER / LLM_MODEL env vars), which receives the full author list
+    and all emails found on the page and returns a JSON mapping.
+
+    --limit N         Process only N papers (0 = all).
+    --force           Overwrite email/institution even if already set.
+    --header-pages N  Number of pages to read from the start of each PDF
+                      when looking for author metadata (default: 2).
+    """
+    import json as _json
+    from pypdf import PdfReader
+
+    mongo_client = MongoClient(MONGO_URI)
+    db = mongo_client[DB_NAME]
+    papers_col = db[COLLECTION_NAME]
+    authors_col = db[AUTHORS_COLLECTION]
+
+    # Build LLM client (used for email-to-author matching)
+    print("Initializing LLM client...")
+    try:
+        ask = build_llm_client()
+    except Exception as e:
+        print(f"Failed to build LLM client: {e}")
+        return
+
+    # Regex patterns
+    email_re = re.compile(
+        r'[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+',
+        re.IGNORECASE,
+    )
+
+    # Common affiliation keywords used in paper headers
+    affiliation_keywords = [
+        'university', 'institute', 'institution', 'laboratory', 'lab',
+        'department', 'dept', 'school', 'college', 'faculty',
+        'research', 'center', 'centre', 'technologies', 'technology',
+        'corp', 'inc', 'ltd', 'ai', 'deepmind', 'openai', 'google',
+        'microsoft', 'amazon', 'meta', 'apple', 'nvidia', 'ibm',
+    ]
+
+    def llm_match_emails(author_names: list, emails: list) -> dict:
+        """
+        Asks the LLM to map each author name to their email address.
+        Returns a dict {author_name: email} for confident matches only.
+        If the LLM cannot match an author confidently it should omit them.
+        """
+        if not emails:
+            return {}
+
+        authors_list = "\n".join(f"  {i+1}. {n}" for i, n in enumerate(author_names))
+        emails_list  = "\n".join(f"  {i+1}. {e}" for i, e in enumerate(emails))
+
+        prompt = (
+            "You are extracting author contact info from an academic paper header.\n"
+            "Match each author below to their email address from the list provided.\n"
+            "Only include matches you are confident about; omit any uncertain ones.\n\n"
+            f"Authors:\n{authors_list}\n\n"
+            f"Email addresses found in the paper:\n{emails_list}\n\n"
+            "Reply with ONLY a JSON object mapping author names (exactly as given) to "
+            "their email address, for example:\n"
+            '{"Alice Smith": "alice@example.com", "Bob Jones": "bob@acme.org"}\n\n'
+            "If no confident match exists for an author, omit them from the JSON. "
+            "Do not include any explanation or extra text."
+        )
+
+        try:
+            response = ask(prompt)
+            # Strip markdown code fences if the model wraps the JSON
+            response = re.sub(r'^```[\w]*\n?', '', response.strip(), flags=re.MULTILINE)
+            response = response.strip().strip('`')
+            mapping = _json.loads(response)
+            # Validate: only keep entries whose value is a string email
+            return {
+                k: v for k, v in mapping.items()
+                if isinstance(k, str) and isinstance(v, str) and '@' in v
+            }
+        except Exception as e:
+            tqdm.write(f"  LLM email-match error: {e}")
+            return {}
+
+    # Fetch papers
+    query = {}
+    total = papers_col.count_documents(query)
+    print(f"Found {total} papers in DB.")
+
+    cursor = papers_col.find(query)
+    if limit > 0:
+        cursor = cursor.limit(limit)
+
+    processed = 0
+    skipped = 0
+    updated_authors = 0
+
+    for paper in tqdm(list(cursor), desc="Parsing PDFs"):
+        paper_id = paper.get("_id")
+        title = paper.get("title", "Untitled")
+        paper_authors = paper.get("authors", [])   # list of name strings
+        paper_authorids = paper.get("authorids", [])
+
+        # Resolve PDF path
+        pdf_path = paper.get("pdf_path")
+        if not pdf_path or not os.path.exists(pdf_path):
+            candidate = os.path.join(PDF_DIR, f"{paper_id}.pdf")
+            if os.path.exists(candidate):
+                pdf_path = candidate
+            else:
+                skipped += 1
+                continue
+
+        # Extract text from the first N pages
+        try:
+            reader = PdfReader(pdf_path)
+            pages_to_read = min(len(reader.pages), header_pages)
+            header_text = "\n".join(
+                reader.pages[i].extract_text() or "" for i in range(pages_to_read)
+            ).strip()
+        except Exception as e:
+            tqdm.write(f"  PDF read error for '{title}': {e}")
+            skipped += 1
+            continue
+
+        if not header_text:
+            skipped += 1
+            continue
+
+        # --- Extract emails ---
+        found_emails = email_re.findall(header_text)
+        # Deduplicate while preserving order
+        seen = set()
+        unique_emails = []
+        for e in found_emails:
+            el = e.lower()
+            if el not in seen:
+                seen.add(el)
+                unique_emails.append(e)
+
+        # --- Extract affiliation lines ---
+        # Heuristic: look for lines that contain affiliation keywords.
+        # We collect up to 3 candidate lines and use the first one as the
+        # primary institution hint.
+        affiliation_lines = []
+        for line in header_text.splitlines():
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            # Skip lines that look like email addresses
+            if email_re.search(line_stripped):
+                continue
+            line_lower = line_stripped.lower()
+            if any(kw in line_lower for kw in affiliation_keywords):
+                # Avoid very long lines (likely paragraph text)
+                if len(line_stripped) < 120:
+                    affiliation_lines.append(line_stripped)
+            if len(affiliation_lines) >= 3:
+                break
+
+        primary_affiliation = affiliation_lines[0] if affiliation_lines else None
+
+        # --- Match emails to authors via LLM ---
+        # Ask the LLM once per paper with all author names + all emails.
+        # It returns a dict {author_name: email} for confident matches.
+        email_mapping = llm_match_emails(paper_authors, unique_emails) if unique_emails else {}
+
+        processed += 1
+
+        # For each author on this paper, apply the LLM-resolved email and update DB
+        for idx, author_name in enumerate(paper_authors):
+            # Determine the DB key for this author (same logic as process_authors)
+            aid = paper_authorids[idx] if idx < len(paper_authorids) else None
+            db_key = aid if (aid and aid.startswith('~')) else author_name
+
+            # Look up existing author doc
+            author_doc = authors_col.find_one({"_id": db_key})
+            if not author_doc:
+                # Try by name in 'names' array
+                author_doc = authors_col.find_one({"names": author_name})
+                if author_doc:
+                    db_key = author_doc["_id"]
+
+            if not author_doc and not force:
+                # Author not yet in DB; skip (process_authors should run first)
+                continue
+
+            already_has_email = bool(author_doc and author_doc.get("email")) if author_doc else False
+            already_has_institution = bool(author_doc and author_doc.get("institution")) if author_doc else False
+
+            # LLM-resolved email for this author (may be None if no confident match)
+            matched_email = email_mapping.get(author_name)
+
+            # Build the update payload — only overwrite if force or field missing
+            update_fields = {}
+
+            if matched_email and (force or not already_has_email):
+                update_fields["email"] = matched_email
+
+            if primary_affiliation and (force or not already_has_institution):
+                update_fields["institution"] = primary_affiliation
+
+            if not update_fields:
+                continue
+
+            # Stamp which paper this info came from
+            update_fields["pdf_enriched_at"] = datetime.now()
+            update_fields["pdf_enriched_from"] = paper_id
+
+            try:
+                if author_doc:
+                    authors_col.update_one(
+                        {"_id": db_key},
+                        {"$set": update_fields},
+                    )
+                else:
+                    # Create a minimal author doc if it doesn't exist yet
+                    new_doc = {
+                        "_id": db_key,
+                        "names": [author_name],
+                        "ids": [aid] if aid else [],
+                        **update_fields,
+                        "updated_at": datetime.now(),
+                    }
+                    authors_col.update_one(
+                        {"_id": db_key},
+                        {"$setOnInsert": new_doc},
+                        upsert=True,
+                    )
+                updated_authors += 1
+            except Exception as e:
+                tqdm.write(f"  DB error for author '{author_name}': {e}")
+
+    print(f"\nPDF author enrichment complete.")
+    print(f"  Papers processed : {processed}")
+    print(f"  Papers skipped   : {skipped}  (no PDF or unreadable)")
+    print(f"  Author fields set: {updated_authors}")
+
 
 @app.command()
 def enrich_authors(limit: int = 0, force: bool = False):
