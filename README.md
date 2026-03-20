@@ -11,6 +11,7 @@ This project provides tools to scrape accepted **ICLR 2026 (Oral)** papers, down
 - **Author Enrichment**: resolves Semantic Scholar IDs, detects prior awards, and finds LinkedIn profiles via DuckDuckGo + LLM.
 - **Synopsis Generation**: reads each paper's PDF and uses a local/remote LLM to produce a VC-friendly synopsis.
 - **CSV Export**: exports a Google Sheets–ready CSV of authors with paper details and LinkedIn URLs.
+- **Google Sheets Sync**: merges author data directly into an existing Google Sheet, preserving any custom columns.
 - **MongoDB Storage**: stores all metadata and analysis results in a MongoDB database.
 
 ## Prerequisites
@@ -190,6 +191,52 @@ uv run main.py export-authors [--output FILE]
 | `--output FILE` | `authors_export.csv` | Output CSV file path |
 
 Columns: `name`, `institution`, `email`, `paper_title`, `paper_url`, `synopsis`, `linkedin_url`
+
+### 10. Sync to Google Sheets
+
+Merge author data directly into an existing Google Sheet:
+
+```bash
+uv run main.py sync-to-sheets SHEET_ID [--sheet-name Sheet1] [--credentials-file service_account.json]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `SHEET_ID` | *(required)* | The ID from your sheet URL: `.../spreadsheets/d/<SHEET_ID>/edit` |
+| `--sheet-name NAME` | `Sheet1` | Name of the tab to sync into |
+| `--credentials-file FILE` | `service_account.json` | Path to your service account JSON key |
+
+Behaviour:
+- Matches rows by `(name, paper_title)` — updates existing rows, appends new ones.
+- Only writes to columns it knows about; any columns you added manually are left untouched.
+- If new columns are added to the schema, they are appended to the header row automatically.
+
+**One-time setup:**
+
+1. **Create a Google Cloud project** (or reuse an existing one) at [console.cloud.google.com](https://console.cloud.google.com).
+
+2. **Enable the Google Sheets API**:
+   - Go to **APIs & Services → Library**.
+   - Search for `Google Sheets API` and click **Enable**.
+
+3. **Create a Service Account**:
+   - Go to **APIs & Services → Credentials → + Create Credentials → Service Account**.
+   - Give it a name (e.g. `iclr-sheets-sync`) and click **Done**.
+   - No special IAM roles are needed — access is controlled by sharing the sheet directly.
+
+4. **Generate a JSON key**:
+   - On the Credentials page, click your new service account.
+   - Go to the **Keys** tab → **Add Key → Create new key → JSON**.
+   - The file downloads automatically. Save it as `service_account.json` in the project root.
+
+5. **Share your Google Sheet with the service account**:
+   - Open `service_account.json` and copy the `client_email` value (e.g. `iclr-sheets-sync@your-project.iam.gserviceaccount.com`).
+   - Open your Google Sheet → **Share** → paste the email → set role to **Editor** → click **Send**.
+
+6. **Protect the key file**:
+   ```bash
+   echo "service_account.json" >> .gitignore
+   ```
 
 ## Recommended Workflow
 

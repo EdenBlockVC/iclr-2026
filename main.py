@@ -1216,13 +1216,139 @@ def generate_synopses(
 
 
 @app.command()
+def generate_questions(
+    limit: int = 0,
+    force: bool = False,
+    max_pages: int = 0,
+    max_chars: int = 0,
+):
+    """
+    Generates 3 insightful questions per paper to ask its authors, by reading
+    the local PDF. Questions are saved to the 'author_questions' field in MongoDB
+    as a list of 3 strings.
+
+    --limit N      Process only N papers (0 = all).
+    --force        Re-generate questions for papers that already have them.
+    --max-pages N  Read at most N pages per PDF (0 = all pages).
+    --max-chars N  Truncate extracted text to N characters before sending to
+                   the LLM (0 = no truncation).
+    """
+    import json as _json
+    from pypdf import PdfReader
+
+    mongo_client = MongoClient(MONGO_URI)
+    db = mongo_client[DB_NAME]
+    collection = db[COLLECTION_NAME]
+
+    print("Initializing LLM client...")
+    try:
+        ask = build_llm_client()
+    except Exception as e:
+        print(f"Failed to build LLM client: {e}")
+        return
+
+    query = {} if force else {"author_questions": {"$exists": False}}
+    total = collection.count_documents(query)
+    print(f"Found {total} papers {'(all, force mode)' if force else 'without questions'}.")
+
+    cursor = collection.find(query)
+    if limit > 0:
+        cursor = cursor.limit(limit)
+
+    processed = 0
+    skipped = 0
+    failed = 0
+
+    for paper in tqdm(list(cursor), desc="Generating Questions"):
+        paper_id = paper.get("_id")
+        title = paper.get("title", "Untitled")
+
+        pdf_path = paper.get("pdf_path")
+        if not pdf_path or not os.path.exists(pdf_path):
+            candidate = os.path.join(PDF_DIR, f"{paper_id}.pdf")
+            if os.path.exists(candidate):
+                pdf_path = candidate
+            else:
+                skipped += 1
+                continue
+
+        try:
+            reader = PdfReader(pdf_path)
+            total_pages = len(reader.pages)
+            pages_to_read = min(total_pages, max_pages) if max_pages > 0 else total_pages
+
+            pages_text = []
+            for i in range(pages_to_read):
+                pages_text.append(reader.pages[i].extract_text() or "")
+            full_text = "\n".join(pages_text).strip()
+        except Exception as e:
+            tqdm.write(f"  Error reading PDF for '{title}': {e}")
+            failed += 1
+            continue
+
+        if not full_text:
+            skipped += 1
+            continue
+
+        truncated = full_text[:max_chars] if max_chars > 0 else full_text
+
+        prompt = (
+            f"You are a venture capital analyst preparing for a meeting with the authors of an academic paper.\n\n"
+            f"Paper title: {title}\n\n"
+            f"Paper content (first few pages):\n{truncated}\n\n"
+            f"Generate exactly 3 questions to ask the authors. The questions should be insightful, specific to this "
+            f"paper's contributions, and relevant to real-world or commercial applications. Avoid generic questions.\n\n"
+            f"Reply with ONLY a JSON array of 3 strings, e.g.:\n"
+            f'["Question one?", "Question two?", "Question three?"]'
+        )
+
+        try:
+            raw = ask(prompt)
+        except Exception as e:
+            tqdm.write(f"  LLM error for '{title}': {e}")
+            failed += 1
+            continue
+
+        # Parse the JSON array from the response
+        try:
+            # Strip markdown code fences if present
+            cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            questions = _json.loads(cleaned)
+            if not isinstance(questions, list) or len(questions) != 3:
+                raise ValueError(f"Expected a list of 3 strings, got: {questions!r}")
+        except Exception as e:
+            tqdm.write(f"  Parse error for '{title}': {e} — raw: {raw[:200]!r}")
+            failed += 1
+            continue
+
+        try:
+            collection.update_one(
+                {"_id": paper_id},
+                {"$set": {
+                    "author_questions": questions,
+                    "author_questions_generated_at": datetime.now(),
+                }}
+            )
+            processed += 1
+        except Exception as e:
+            tqdm.write(f"  DB error saving questions for '{title}': {e}")
+            failed += 1
+
+    print(f"\nQuestion generation complete.")
+    print(f"  Generated : {processed}")
+    print(f"  Skipped   : {skipped}  (no PDF or empty text)")
+    print(f"  Failed    : {failed}")
+
+
+@app.command()
 def export_authors(
     output: str = "authors_export.csv",
 ):
     """
     Exports a CSV of authors with their ICLR 2026 paper details and LinkedIn URL.
 
-    Columns: name, paper_title, paper_url, synopsis, linkedin_url
+    Columns: name, paper_title, paper_url, synopsis, question_1, question_2,
+             question_3, linkedin_url
 
     The file is ready to be imported as a Google Sheet.
     """
@@ -1250,6 +1376,7 @@ def export_authors(
 
         if papers:
             for paper in papers:
+                questions = paper.get("author_questions", [])
                 rows.append({
                     "name": name,
                     "institution": institution,
@@ -1257,6 +1384,9 @@ def export_authors(
                     "paper_title": paper.get("title", ""),
                     "paper_url": paper.get("forum_url", paper.get("pdf_url", "")),
                     "synopsis": paper.get("synopsis", ""),
+                    "question_1": questions[0] if len(questions) > 0 else "",
+                    "question_2": questions[1] if len(questions) > 1 else "",
+                    "question_3": questions[2] if len(questions) > 2 else "",
                     "linkedin_url": linkedin_url,
                 })
         else:
@@ -1268,10 +1398,13 @@ def export_authors(
                 "paper_title": "",
                 "paper_url": "",
                 "synopsis": "",
+                "question_1": "",
+                "question_2": "",
+                "question_3": "",
                 "linkedin_url": linkedin_url,
             })
 
-    fieldnames = ["name", "institution", "email", "paper_title", "paper_url", "synopsis", "linkedin_url"]
+    fieldnames = ["name", "institution", "email", "paper_title", "paper_url", "synopsis", "question_1", "question_2", "question_3", "linkedin_url"]
 
     with open(output, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -1279,6 +1412,183 @@ def export_authors(
         writer.writerows(rows)
 
     print(f"Exported {len(rows)} rows to '{output}'.")
+
+
+OUR_COLUMNS = [
+    "name", "institution", "email", "paper_title", "paper_url",
+    "synopsis", "question_1", "question_2", "question_3", "linkedin_url",
+]
+
+
+def _col_letter(index: int) -> str:
+    """Convert 0-based column index to A1 notation letter (A, B, ..., Z, AA, ...)."""
+    result = ""
+    index += 1
+    while index > 0:
+        index, rem = divmod(index - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+def _build_author_rows(db) -> list[dict]:
+    """Fetch author-paper data from MongoDB and return list of row dicts."""
+    authors_col = db[AUTHORS_COLLECTION]
+    papers_col = db[COLLECTION_NAME]
+    authors = list(authors_col.find({}))
+    rows = []
+    for author in authors:
+        name = author.get("names", [""])[0]
+        linkedin_url = author.get("linkedin_url", "")
+        institution = author.get("institution") or author.get("openreview", {}).get("institution", "")
+        email = author.get("email") or author.get("openreview", {}).get("email", "")
+        author_names = author.get("names", [])
+        papers = list(papers_col.find({"authors": {"$in": author_names}}))
+        if papers:
+            for paper in papers:
+                questions = paper.get("author_questions", [])
+                rows.append({
+                    "name": name,
+                    "institution": institution,
+                    "email": email,
+                    "paper_title": paper.get("title", ""),
+                    "paper_url": paper.get("forum_url", paper.get("pdf_url", "")),
+                    "synopsis": paper.get("synopsis", ""),
+                    "question_1": questions[0] if len(questions) > 0 else "",
+                    "question_2": questions[1] if len(questions) > 1 else "",
+                    "question_3": questions[2] if len(questions) > 2 else "",
+                    "linkedin_url": linkedin_url,
+                })
+        else:
+            rows.append({
+                "name": name,
+                "institution": institution,
+                "email": email,
+                "paper_title": "",
+                "paper_url": "",
+                "synopsis": "",
+                "question_1": "",
+                "question_2": "",
+                "question_3": "",
+                "linkedin_url": linkedin_url,
+            })
+    return rows
+
+
+@app.command()
+def sync_to_sheets(
+    sheet_id: str = typer.Argument(..., help="Google Sheet ID (from the URL: /spreadsheets/d/<ID>/edit)"),
+    sheet_name: str = typer.Option("Sheet1", help="Name of the tab/sheet to sync into"),
+    credentials_file: str = typer.Option("service_account.json", help="Path to service account JSON key file"),
+):
+    """
+    Syncs author data from MongoDB into an existing Google Sheet.
+
+    Merges by (name, paper_title): updates existing rows, appends new ones.
+    Preserves any custom columns already in the sheet.
+
+    Setup:
+      1. Create a service account in Google Cloud Console with Sheets API enabled.
+      2. Download the JSON key and save as service_account.json (or pass --credentials-file).
+      3. Share your Google Sheet with the service account email (Editor role).
+    """
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+
+    creds = Credentials.from_service_account_file(
+        credentials_file,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    service = build("sheets", "v4", credentials=creds)
+    sheets = service.spreadsheets()
+
+    # --- Read existing sheet ---
+    result = sheets.values().get(spreadsheetId=sheet_id, range=sheet_name).execute()
+    existing_rows = result.get("values", [])
+
+    existing_headers: list[str] = existing_rows[0] if existing_rows else []
+    header_index: dict[str, int] = {h: i for i, h in enumerate(existing_headers)}
+
+    # --- Reconcile headers: add any of our columns missing from the sheet ---
+    merged_headers = list(existing_headers)
+    for col in OUR_COLUMNS:
+        if col not in header_index:
+            header_index[col] = len(merged_headers)
+            merged_headers.append(col)
+
+    headers_changed = merged_headers != existing_headers
+
+    # --- Build lookup: (name, paper_title) → sheet row number (1-based, row 1 = header) ---
+    name_idx = header_index.get("name", 0)
+    title_idx = header_index.get("paper_title", 3)
+    row_lookup: dict[tuple[str, str], int] = {}
+    for i, row in enumerate(existing_rows[1:], start=2):
+        r_name = row[name_idx] if name_idx < len(row) else ""
+        r_title = row[title_idx] if title_idx < len(row) else ""
+        row_lookup[(r_name, r_title)] = i
+
+    # --- Fetch MongoDB data ---
+    mongo_client = MongoClient(MONGO_URI)
+    db = mongo_client[DB_NAME]
+    mongo_rows = _build_author_rows(db)
+    print(f"Fetched {len(mongo_rows)} rows from MongoDB.")
+
+    # --- Compute updates vs appends ---
+    value_updates = []   # list of (range_str, [[value]]) for individual cell ranges
+    rows_to_append: list[list[str]] = []
+
+    for row_data in mongo_rows:
+        key = (row_data["name"], row_data["paper_title"])
+        if key in row_lookup:
+            sheet_row = row_lookup[key]
+            # Build cell updates only for our columns
+            for col_name in OUR_COLUMNS:
+                col_idx = header_index[col_name]
+                cell_range = f"{sheet_name}!{_col_letter(col_idx)}{sheet_row}"
+                value_updates.append({
+                    "range": cell_range,
+                    "values": [[row_data.get(col_name, "")]],
+                })
+        else:
+            # New row: build full-width list padded to merged_headers length
+            new_row = [""] * len(merged_headers)
+            for col_name in OUR_COLUMNS:
+                new_row[header_index[col_name]] = row_data.get(col_name, "")
+            rows_to_append.append(new_row)
+
+    # --- Write header row if it changed ---
+    if headers_changed:
+        sheets.values().update(
+            spreadsheetId=sheet_id,
+            range=f"{sheet_name}!A1",
+            valueInputOption="RAW",
+            body={"values": [merged_headers]},
+        ).execute()
+        print(f"Updated header row (added {len(merged_headers) - len(existing_headers)} new column(s)).")
+
+    # --- Batch update existing rows ---
+    if value_updates:
+        sheets.values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"valueInputOption": "RAW", "data": value_updates},
+        ).execute()
+        updated_count = len(set(u["range"].split("!")[1][1:] for u in value_updates))
+        print(f"Updated {updated_count} existing row(s).")
+
+    # --- Append new rows ---
+    if rows_to_append:
+        sheets.values().append(
+            spreadsheetId=sheet_id,
+            range=f"{sheet_name}!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows_to_append},
+        ).execute()
+        print(f"Appended {len(rows_to_append)} new row(s).")
+
+    if not value_updates and not rows_to_append:
+        print("Sheet is already up to date.")
+    else:
+        print("Sync complete.")
 
 
 if __name__ == "__main__":
